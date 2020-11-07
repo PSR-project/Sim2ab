@@ -1,0 +1,567 @@
+import numpy as np
+from scipy.optimize import fsolve
+import matplotlib.pyplot as plt
+from google.colab import drive
+import os
+import csv
+from datetime import datetime
+drive.mount('/drive')
+#Written by Alec Lau, last updated sep. 29, 2020
+
+solverPrecision = 1e-6
+
+'''
+Helper function to initialize coordinates and velocity
+
+Parameters:
+- S_i, the spatial wavelength of the sinusoidal walls
+- A_i, the amplitude of the sinusoidal walls
+- Z0_i, the average radius of the tube (the radius of tube at x is Z0+A*sin(2pi*x/S))
+- v_flow, the initial flow velocity in the x direction (z component identically 
+  0 for every set of parameters)
+- variance, the variance of the distribution from which the magnitude of the 
+  random velocities are drawn
+- timestepNum, the number of time steps in the simulation (an int)
+- xc (optional), a custom x initial coordinate
+- yc (optional), a custom y initial coordiinate
+- zc (optional), a custom z initial coordinate
+- vxc (optional), a custom x initial velocity
+- vyc (optional), a custom y initial velocity
+- vzc (optional), a custom z initial velocity
+
+Returns:
+- size 1 array with initial x coordinate in the first index
+- size 1 array with initial y coordinate in the first index
+- size 1 array with initial z coordinate in the first index
+- size 1 array with initial x velocity in the first index
+- size 1 array with initial y velocity in the first index
+- size 1 array with initial z velocity in the first index
+'''
+def initializeParticleArrays(wallWavelength_i, wallAmplitude_i, averageRadius_i, 
+                initialFlow, variance, xc=None, yc=None, zc=None, vxc=None, 
+                vyc=None, vzc=None):
+  #if custom values given, account for that in code below
+  initialX = xc
+  if xc == None:
+    initialX = wallWavelength_i*np.random.random_sample() # continuous uniform distribution
+
+  initialY = yc
+  if yc == None:
+    initialY = 2*(wallAmplitude_i+averageRadius_i)*np.random.random_sample() - wallAmplitude_i - averageRadius_i
+
+  initialZ = zc
+  if zc == None:
+    #choose point within the outer radius to assure uniformity
+    initialZ = 2*(wallAmplitude_i+averageRadius_i)*np.random.random_sample() - wallAmplitude_i - averageRadius_i
+  initialRange = averageRadius_i+wallAmplitude_i*np.cos(2*np.pi*initialX/wallWavelength_i)
+  
+  # may want to add in a function to that re-generates the x coordinate to ensure the radius is in the initial range
+  while np.sqrt(initialY**2+initialZ**2) > initialRange: # ensures z is within range
+    #print("Initial coordinates must be in range, re-choosing starting random coordinates")
+    initialY = 2*(wallAmplitude_i+averageRadius_i)*np.random.random_sample() - wallAmplitude_i - averageRadius_i
+    initialZ = 2*(wallAmplitude_i+averageRadius_i)*np.random.random_sample() - wallAmplitude_i - averageRadius_i
+
+  # magnitudes have normal distribution, 0 mean, same variance (a parameter) 
+  # if custom values given, account for that in code below
+  initialVx, initialVy, initialVz = vxc, vyc, vzc
+  if vxc == None:
+    initialVx = np.random.normal(scale=np.sqrt(variance)) + initialFlow
+  if vyc == None:
+    initialVy = np.random.normal(scale=np.sqrt(variance))
+  if vzc == None:
+    initialVz = np.random.normal(scale=np.sqrt(variance))
+  
+  return initialX, initialY, initialZ, initialVx, initialVy, initialVz
+
+'''
+Given slope, point, and a variable, calculates y = mx+b from point-slope formula
+'''
+
+def linear(slope, x_point, z_point, variable):
+  #used in collision function to solve for collision point
+  return slope*variable - slope*x_point + z_point
+
+'''
+Polar coordinate theta function
+'''
+def theta(x,y):
+  if x > 0:
+    return np.arctan(y/x)
+  elif x < 0 and y >= 0:
+    return np.arctan(y/x) + np.pi
+  elif x < 0 and y < 0:
+    return np.arctan(y/x) - np.pi
+  elif x == 0 and y > 0:
+    return np.pi/2
+  elif x == 0 and y < 0:
+    return -np.pi/2
+  else: # if x = y = 0
+    return 0 # just so things are well-defined
+
+'''
+Function for determining the intersection point of a line defined by two points 
+with a circle of a given radius. If furthest=False, return the closest intersec-
+tion point with (y1, z1). If furthest=True, return the furthest intersection 
+point from (y1, z1)
+
+Inputs:
+- y1, the y coordinate of the first point
+- z1, the z coordinate of the first point
+- y2, the y coordinate of the second point
+- z2, the z coordinate of the second point
+- circleRadius, the radius of the circle
+- furthest, a boolean determining whether the function should return the 
+furthest or closest point to (y1, z1)
+
+Outputs:
+- y coordinate of intersection
+- z coordinate of intersection
+'''
+
+def circleLineIntersection(y1, z1, y2, z2, circleRadius, furthest=False):
+  dy = y2 - y1
+  dz = z2 - z1
+  dr = np.sqrt(dy**2 + dz**2)
+  determinant = y1*z2 - y2*z1
+  discriminant = circleRadius**2*dr**2 - determinant**2
+  if discriminant < 0:
+    print("No intersection!")
+  #finding two intersections points between the trajectory and the inner radius
+  intersectionY1 = 0.0
+  intersectionY2 = 0.0
+  if dz >= 0.0:
+    intersectionY1 = (determinant*dz + dy*np.sqrt(discriminant))/dr**2
+    intersectionY2 = (determinant*dz - dy*np.sqrt(discriminant))/dr**2
+  else:
+    intersectionY1 = (determinant*dz + dz/abs(dz)*dy*np.sqrt(discriminant))/dr**2
+    intersectionY2 = (determinant*dz - dz/abs(dz)*dy*np.sqrt(discriminant))/dr**2
+  intersectionZ1 = (-determinant*dy + abs(dz)*np.sqrt(discriminant))/dr**2
+  intersectionZ2 = (-determinant*dy - abs(dz)*np.sqrt(discriminant))/dr**2
+  #determine which intersection point is further away, and set that as the new future coordinates
+  d1 = np.sqrt((intersectionY1-y1)**2 + (intersectionZ1-z1)**2)
+  d2 = np.sqrt((intersectionY2-y1)**2 + (intersectionZ2-z1)**2)
+  if d1 > d2:
+    if furthest == True:
+      return intersectionY1, intersectionZ1
+    else:
+      return intersectionY2, intersectionZ2
+  else:
+    if furthest == True:
+      return intersectionY2, intersectionZ2
+    else:
+      return intersectionY1, intersectionZ1
+
+'''
+Helper function for determining next coordinate after collision with sinusoidal
+walls. Uses scipy's fsolve function for finding the most accurate intersection point
+available to python
+
+Inputs:
+- wallWavelength, wallAmplitude, averageRadius
+- x, the x coordinate before the collision
+- y, the y coordinate before the collision
+- z, the z coordinate before the collision
+- vx, the x velocity before the collision
+- vy, the y velocity before the collision
+- vz, the z velocity before the collision
+- timeStep, the timestep of the simulation
+
+Returns:
+- xAfter, the x coordinate after the collision
+- yAfter, the y coordinate after the collision
+- zAfter, the z coordinate after the collision
+- collisionPointX, the x coordinate of the collision point
+- collisionPointY, the y coordinate of the collision point
+- collisionPointZ, the z coordinate of the collision point
+- vxAfter, the x velocity after the collision
+- vyAfter, the y velocity after the collision
+- vzAfter, the z velocity after the collision
+'''
+
+def collision(wallWavelength_c, wallAmplitude_c, averageRadius_c, x, y, z, vx, vy, vz, timeStep_c, wallFunction):
+  # find where the particle hits the wall. This is a nonlinear algebraic equation,
+  # so we use scipy's fsolve function to find this in the code below
+  collisionX = 0.0
+  collisionY = 0.0
+  collisionZ = 0.0
+  # in order to solve the new x and vx, project to where radius is the 2d example's z
+  collisionR = 0.0
+  radial = np.sqrt(y**2 + z**2)
+  # we take the radial velocity at the point just before the collision. This is because we
+  # assume that the change in step is very small, corresponding to a very small change in
+  # theta, and thus gives us a first order approximation of the radial velocity. The radial
+  # velocity is needed to find the x coordinate of the collision, and thus the radius of the
+  # circle whence we calculate our y and z coordinates of the collision.
+  velocityRadial = (y*vy + z*vz)/radial
+  def intersection(t):
+    return wallFunction(x+vx*t) - np.sqrt((y+vy*t)**2 + (z+vz*t)**2)
+  timeToIntersection = fsolve(intersection, 0.0, xtol=solverPrecision)
+  collisionX = x+vx*timeToIntersection
+  collisionR = wallFunction(collisionX)
+
+  collisionY = y+vy*timeToIntersection
+  collisionZ = z+vz*timeToIntersection
+  if np.sqrt(collisionY**2+collisionZ**2) > collisionR:
+    collisionTheta = theta(collisionY, collisionZ)
+    collisionY = collisionR*np.cos(collisionTheta)
+    collisionZ = collisionR*np.sin(collisionTheta)
+  # now we have the collision coordinates - time to calculate the tangent vectors
+  wallTangentLineSlope = -wallAmplitude_c*np.sin(2*np.pi*collisionX/wallWavelength_c)*2*np.pi/wallWavelength_c
+  # the change in x of the UNIT tangent vector is then cos(arctan(slope)), or 1/(1+slope^2),
+  wallTangentChangeInX = 1/np.sqrt(1+wallTangentLineSlope**2)
+  # the change in R of the UNIT tangent vector is then sin(arctan(slope)), or slope/(1+slope^2)
+  wallTangentChangeInR = wallTangentLineSlope/np.sqrt(1+wallTangentLineSlope**2)
+  # now change this last component into y, z basis
+  wallTangentChangeInZ = wallTangentChangeInR*collisionZ/collisionR
+  wallTangentChangeInY = wallTangentChangeInR*collisionY/collisionR
+
+  # we have our vector tangent to the sinusoid, now we need a vector tangent to the circle
+  circleTangentChangeInY = 0.0
+  circleTangentChangeInZ = 0.0
+
+  if collisionZ != 0:
+    circleTangentSlope = -collisionY/np.sqrt(collisionR**2 - collisionY**2)*collisionZ/abs(collisionZ)
+    circleTangentChangeInZ = circleTangentSlope/(1+circleTangentSlope**2)
+    circleTangentChangeInY = 1/(1+circleTangentSlope**2)#*collisionZ/abs(collisionZ)
+  else:
+    circleTangentChangeInZ = collisionY/abs(collisionY)
+    circleTangentChangeInY = 0.0
+
+  # Now we have our two (unit) tangent vectors, so we create our unit normal vector to the surface at the
+  # point of impact by taking the cross product [wallTangent] x [circleTangent]
+  unitNormalChangeInX = circleTangentChangeInY*wallTangentChangeInZ - wallTangentChangeInY*circleTangentChangeInZ
+  unitNormalChangeInY = wallTangentChangeInX*circleTangentChangeInZ
+  unitNormalChangeInZ = -wallTangentChangeInX*circleTangentChangeInY
+  normalNorm = np.sqrt(unitNormalChangeInX**2+unitNormalChangeInY**2+unitNormalChangeInZ**2)
+
+  unitNormalChangeInX /= normalNorm
+  unitNormalChangeInY /= normalNorm
+  unitNormalChangeInZ /= normalNorm
+
+  # once we have our unit normal vector N, the formula for the reflected velocity is -2(N dot V)N - V
+  dotProduct = unitNormalChangeInX*vx + unitNormalChangeInY*vy + unitNormalChangeInZ*vz
+  vxAfter = -2*dotProduct*unitNormalChangeInX + vx
+  vyAfter = -2*dotProduct*unitNormalChangeInY + vy
+  vzAfter = -2*dotProduct*unitNormalChangeInZ + vz
+  # now we need to find the distance traveled after the collision, as the collsion is in the middle of
+  # the current timestep. Take the distance from the previous point to the collision, divide by the
+  # magnitude of the velocity, and subtract this from the timestep
+  timeLeft = timeStep_c - timeToIntersection
+
+  xAfter = collisionX + vxAfter*timeLeft
+  yAfter = collisionY + vyAfter*timeLeft
+  zAfter = collisionZ + vzAfter*timeLeft
+  return xAfter[0], yAfter[0], zAfter[0], collisionX[0], collisionY[0], collisionZ[0], vxAfter[0], vyAfter[0], vzAfter[0], timeToIntersection[0]
+
+################################################################################
+################################################################################
+################################################################################
+
+from bokeh.layouts import gridplot
+from bokeh.plotting import figure, output_file, show
+from bokeh.models import HoverTool
+from bokeh.io import output_notebook
+
+output_notebook()
+
+def plotTrajectory(dataMatrix, wallWavelength_p, wallAmplitude_p, averageRadius_p):
+  def wall_plot(x):
+    return averageRadius_p + wallAmplitude_p*np.cos(2*np.pi*x/wallWavelength_p)
+  index = -1
+  for i in reversed(dataMatrix["numCols"]):
+    if i == 0:
+      break
+    index -= 1
+  X_array = dataMatrix["X"][index:]
+  Y_array = dataMatrix["Y"][index:]
+  Z_array = dataMatrix["Z"][index:]
+  coord_max = max(np.amax(X_array), np.amax(Y_array))
+  coord_min = min(np.amin(X_array), np.amin(Y_array))
+  coords = np.linspace(coord_min, coord_max, max(8000,max(len(X_array), len(Y_array))))
+  TOOLS = "pan,wheel_zoom,box_zoom,reset,save,box_select,hover"
+
+  p1 = figure(title="Particle Trajectory, X-Z", tools=TOOLS, plot_width=1000, plot_height=400)
+  p2 = figure(title="Particle Trajectory, X-Y", tools=TOOLS, plot_width=1000, plot_height=400)
+  p3 = figure(title="Particle Trajectory, Y-Z", tools=TOOLS, plot_width=500, plot_height=500)
+
+  p1.line(coords, wall_plot(coords), color="orange")
+  p1.line(coords, -wall_plot(coords), color="orange")
+  p1.line(X_array, Z_array, color="blue")
+  p2.line(coords, wall_plot(coords), color="orange")
+  p2.line(coords, -wall_plot(coords), color="orange")
+  p2.line(X_array, Y_array, color="blue")
+  p3.line(Y_array, Z_array, color="blue")
+
+  outerCircleCoords = np.linspace(-averageRadius_p-wallAmplitude_p, averageRadius_p+wallAmplitude_p, 2000)
+  innerCircleCoords = np.linspace(-averageRadius_p+wallAmplitude_p, averageRadius_p-wallAmplitude_p, 2000)
+  
+  p3.line(outerCircleCoords,np.sqrt((averageRadius_p+wallAmplitude_p)**2-outerCircleCoords**2), color="red")
+  p3.line(outerCircleCoords,-np.sqrt((averageRadius_p+wallAmplitude_p)**2-outerCircleCoords**2), color="red")
+  p3.line(innerCircleCoords,np.sqrt((averageRadius_p-wallAmplitude_p)**2-innerCircleCoords**2), color="red")
+  p3.line(innerCircleCoords,-np.sqrt((averageRadius_p-wallAmplitude_p)**2-innerCircleCoords**2), color="red")
+  
+  source = dict(
+      hoverX=X_array,
+      hoverZ=Z_array
+  )
+  
+  p1.add_tools(HoverTool(
+      tooltips=[
+      ("(x,y)", "($hoverX, $hoverZ)")]
+  ))
+
+  show(p1)
+  show(p2)
+  show(p3)
+
+def plotInitialCoordinates(dataMatrix, wavelength, aveRadius, amp):
+  def wall_plot(x):
+    return aveRadius + amp*np.cos(2*np.pi*x/wavelength)
+  initialX = []
+  initialY = []
+  initialZ = []
+  index = 0
+  for time in dataMatrix["time"]:
+    if time == 0:
+      initialX.append(dataMatrix["X"][index])
+      initialY.append(dataMatrix["Y"][index])
+      initialZ.append(dataMatrix["Z"][index])
+    index += 1
+  plt.scatter(initialX, initialZ)
+  wall_coords = np.linspace(np.amin(initialX), np.amax(initialX), 500)
+  plt.plot(wall_coords, wall_plot(wall_coords))
+  plt.plot(wall_coords, -wall_plot(wall_coords))
+  plt.xlabel('x')
+  plt.ylabel('z')
+  plt.xlim((0,wavelength))
+  plt.ylim((-aveRadius-amp*1.5,aveRadius+amp*1.5))
+  plt.title("Initial positions")
+  plt.show()
+
+  plt.scatter(initialX, initialY)
+  plt.plot(wall_coords, wall_plot(wall_coords))
+  plt.plot(wall_coords, -wall_plot(wall_coords))
+  plt.xlabel('x')
+  plt.ylabel('y')
+  plt.xlim((-aveRadius-amp*1.5,aveRadius+amp*1.5))
+  plt.ylim((-aveRadius-amp*1.5,aveRadius+amp*1.5))
+  plt.title("Initial positions")
+  plt.show()
+
+def plotVelocityModuli(dataMatrix, binNumber):
+  moduli = []
+  index = 0
+  for time in dataMatrix["time"]:
+    if time == 0:
+      moduli.append(np.sqrt(dataMatrix["Vx"][index]**2 + dataMatrix["Vy"][index]**2 + dataMatrix["Vz"][index]**2))
+    index += 1
+  _ = plt.hist(moduli, bins=binNumber)
+  plt.xlabel('|V|')
+  plt.ylabel('Frequency')
+  plt.title('Velocity Modulus Scales')
+  plt.show()
+
+def plotFinalCoordinates(dataMatrix):
+  finalX = []
+  finalY = []
+  finalZ = []
+  index = 0
+  for time in dataMatrix["time"]:
+    if time == time_test:
+      finalX.append(dataMatrix["X"][index])
+      finalY.append(dataMatrix["Y"][index])
+      finalZ.append(dataMatrix["Z"][index])
+    index += 1
+  plt.scatter(finalX, finalZ)
+  plt.xlabel('x')
+  plt.ylabel('z')
+  plt.title("Final positions")
+  plt.show()
+
+  plt.scatter(finalX, finalY)
+  plt.xlabel('x')
+  plt.ylabel('y')
+  plt.title("Final positions")
+  plt.show()
+
+def averageVelocities(dataMatrix, numberIntervals, amp, aveRadius, time_plot, initialFlow):
+  numSimulations = 0
+  averageVelocityX = np.zeros(numberIntervals+1)
+  averageVelocityY = np.zeros(numberIntervals+1)
+  averageVelocityZ = np.zeros(numberIntervals+1)
+  aveModuli = np.zeros(numberIntervals+1)
+  timeIndex = 0
+  timeInterval = time_plot/numberIntervals
+  for index in range(0, len(dataMatrix["time"])):
+    time = dataMatrix["time"][index]
+    if time == 0:
+      numSimulations += 1
+      intervalIndex = 0
+    else:
+      while intervalIndex*timeInterval <= time:
+        averageVelocityX[intervalIndex] += dataMatrix["Vx"][index-1]
+        averageVelocityY[intervalIndex] += dataMatrix["Vy"][index-1]
+        averageVelocityZ[intervalIndex] += dataMatrix["Vz"][index-1]
+        aveModuli[intervalIndex] += np.sqrt(dataMatrix["Vx"][index-1]**2+dataMatrix["Vy"][index-1]**2+dataMatrix["Vz"][index-1]**2)
+        intervalIndex += 1
+
+  averageVelocityX /= numSimulations
+  averageVelocityY /= numSimulations
+  averageVelocityZ /= numSimulations
+  aveModuli /= numSimulations
+  timeCoords = np.linspace(0.0, time_plot, numberIntervals+1)
+  newFileName = "PSR_sim2_analysis_"+str(amp)+"_"+str(aveRadius)+"_"+str(initialFlow)+"_"+str(time_plot)+".csv"
+  if os.path.isfile(newFileName):
+    os.remove(newFileName)
+  with open(newFileName, 'w', newline='') as file:
+      writer = csv.writer(file)
+      writer.writerow("Data provided in order: total number of particles, time, average Vx, average Vy, and average Vz")
+      writer.writerow([numSimulations])
+      writer.writerow(timeCoords)
+      writer.writerow(averageVelocityX)
+      writer.writerow(averageVelocityY)
+      writer.writerow(averageVelocityZ)
+      file.close()
+
+  fig, (ax1, ax2, ax3) = plt.subplots(3)
+  fig.suptitle('Average velocities in time intervals')
+  ax3.set(xlabel='Time')
+  ax1.set(ylabel='Average Vx')
+  ax2.set(ylabel='Average Vy')
+  ax3.set(ylabel='Average Vz')
+  ax1.plot(timeCoords, averageVelocityX)
+  ax1.set(ylim=(-initialFlow*1.5,initialFlow*1.5))
+  ax2.plot(timeCoords, averageVelocityY)
+  ax3.plot(timeCoords, averageVelocityZ)
+  plt.show(fig)
+
+  plt.plot(timeCoords, aveModuli)
+  plt.xlabel("Time")
+  plt.ylabel("Average |V|")
+  plt.ylim((initialFlow-1,initialFlow+1))
+  plt.title("Average velocity modulus vs. time")
+  plt.show()
+
+################################################################################
+################################################################################
+################################################################################
+
+'''
+Function for simulating a single particle according to the specs 
+given for sim2. It takes a particle object and evolves its position, velocity, and
+collision count.
+
+Inputs:
+- S, the spatial wavelength of the sinusoidal walls
+- A, the amplitude of the sinusoidal walls
+- Z0, the average radius of the tube
+- vf, the initial flow velocity in the x direction
+- vr_var, the variance of the random initial velocity
+- t, the simulation time
+- Xc (optional), a custom x initial coordinate
+- Yc (optional), a custom y initial coordinate
+- Zc (optional), a custom z initial coordinate
+- Vxc (optional), a custom x initial velocity
+- Vyc (optional), a custom y initial veloctty
+- Vzc (optional), a custom z initial velocity
+
+Returns:
+- X, an array of x coordinates with indices at each collision and start and end
+- Y, an array of y coordinates with indices at each collision and start and end
+- Z, an array of z coordinates with indices at each collision and start and end
+- Vx, an array of x velocity with indices at each collision and start and end
+- Vy, an array of y velocity with indices at each collision and start and end
+- Vz, an array of z velocity with indices at each collision and start and end
+- B_t, the number of collisions during the run
+'''
+
+# we may create a particle object later, but for now that seems unnecessary
+
+def sim2(wallWavelength, wallAmplitude, averageRadius, initialFlow, velocityVariance, time, Xc=None, Yc=None, Zc=None, Vxc=None, Vyc=None, Vzc=None):
+  # we want to discretize time to be fine enough so that the simulation is useful
+  # i.e. we want to be able to tell when a collision needs to be calculated
+  X, Y, Z, Vx, Vy, Vz = initializeParticleArrays(wallWavelength, wallAmplitude, averageRadius, initialFlow, velocityVariance, Xc, Yc, Zc, Vxc, Vyc, Vzc)
+  numberOfCollisions = 0
+  fileName = "PSR_sim2_runData_"+str(wallAmplitude_test)+"_"+str(averageRadius_test)+"_"+str(initialFlow_test)+"_"+str(time_test)+".csv"
+  if not os.path.isfile(fileName):
+    with open(fileName, 'w', newline='') as file:
+      writer = csv.writer(file)
+      writer.writerow(["collision number","time of collision","x-coord","y-coord","z-coord","x-velocity","y-velocity","z-velocity","date-time"])
+      file.close()
+      print("File at: "+str(os.path))
+  if Vx == 0.0 and Vz == 0.0 and Vy == 0.0: # for robustness' sake
+    X, Y, Z, Vx, Vy, Vz = initializeParticleArrays(wallWavelength, wallAmplitude, averageRadius, initialFlow, velocityVariance, Xc, Yc, Zc, Vxc, Vyc, Vzc)
+  deltaT = min(wallWavelength/5, wallWavelength/(abs(Vx)*5)) # finds time step size
+  #calculate wall function given the dimensions that were input
+  def wallFunction(wallFunctionVariable):
+    return averageRadius+wallAmplitude*np.cos(2*np.pi*wallFunctionVariable/wallWavelength)
+  pastX = X
+  pastY = Y
+  pastZ = Z
+  initialTime = time
+  with open(fileName, 'a', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerow([numberOfCollisions, 0.0, X, Y, Z, Vx, Vy, Vz, datetime.now()])
+    while time > 0:
+      futureVx = Vx
+      futureVy = Vy
+      futureVz = Vz
+      deltaT = min(wallWavelength/5, wallWavelength/(5*np.sqrt((futureVx**2+futureVy**2+futureVz**2)*(pastY**2+pastZ**2))))
+      if time < deltaT: #ensures the final coordinate is recorded
+        deltaT = time
+      #step the x and z positions one timestep
+      futureX = pastX + Vx*deltaT
+      futureY = pastY + Vy*deltaT
+      futureZ = pastZ + Vz*deltaT
+      #check to see if this step is actually a step over a wall, and hence a collision
+      if np.sqrt(futureY**2 + futureZ**2) >= averageRadius+wallAmplitude*np.cos(2*np.pi*futureX/wallWavelength):
+        #get new coordinates, velocities, and collision coordinates
+        pastVx = futureVx
+        futureX, futureY, futureZ, collisionX, collisionY, collisionZ, futureVx, futureVy, futureVz, timeCol = collision(wallWavelength, wallAmplitude, averageRadius, pastX, pastY, pastZ, futureVx, futureVy, futureVz, deltaT, wallFunction)
+        numberOfCollisions += 1
+        writer.writerow([numberOfCollisions,initialTime-time+timeCol,collisionX,collisionY,collisionZ,futureVx,futureVy,futureVz,datetime.now()])
+        #add this new data to our arrays
+        if time == deltaT:
+          # if it's the remaining time, record where it ends up instead of where it hits
+          writer.writerow([numberOfCollisions,initialTime,futureX,futureY,futureZ,futureVx,futureVy,futureVz,datetime.now()])
+        Vx = futureVx
+        Vy = futureVy
+        Vz = futureVz
+      elif time == deltaT:
+        # record final coordinate if our remaining time is less than what our calculated
+        # deltaT would be, AND if there was no collision.
+        writer.writerow([numberOfCollisions,initialTime,futureX,futureY,futureZ,futureVx,futureVy,futureVz,datetime.now()])
+      else: # check if it's crossing the other boundary, then we can skip a lot of computations
+        if np.sqrt(pastY**2+pastZ**2) >= averageRadius-wallAmplitude and np.sqrt(futureY**2+futureZ**2) < averageRadius-wallAmplitude:
+          futureY, futureZ = circleLineIntersection(pastY, pastZ, futureY, futureZ, averageRadius-wallAmplitude, furthest=True)
+          #we now have our new coordinates - we skipped across the gap to the other side of the tube
+          #now we have to calculate how much time that took
+          deltaT = np.sqrt(((futureY-pastY)**2+(futureZ-pastZ)**2)/(futureVy**2+futureVz**2))
+          futureX = pastX + futureVx*deltaT
+          #check to see if this time difference if larger than the time left. If so, just travel with time left
+          if deltaT > time:
+            writer.writerow([numberOfCollisions,initialTime,pastX+futureVx*time,pastY+futureVy*time,pastZ+futureVz*time,futureVx,futureVy,futureVz,datetime.now()])
+            deltaT = time
+      pastX = futureX
+      pastY = futureY
+      pastZ = futureZ
+      time -= deltaT
+
+################################################################################
+
+def runSimulations(wallWavelength_t, wallAmplitude_t, averageRadius_t, initialFlow_t, velocityVariance_t, time_t, number_sims):
+  def wall(x):
+    return averageRadius_t + wallAmplitude_t*np.cos(2*np.pi*x/wallWavelength_t)
+  fileName = "PSR_sim2_runData_"+str(wallAmplitude_t)+"_"+str(averageRadius_t)+"_"+str(initialFlow_t)+"_"+str(time_t)+".csv"
+
+  for i in range(0, number_sims):
+    sim2(wallWavelength_t, wallAmplitude_t, averageRadius_t, initialFlow_t, velocityVariance_t, time_t)
+
+  data = np.genfromtxt(fileName, delimiter=",", names=["numCols","time","X","Y","Z","Vx","Vy","Vz","date_time"])[1:]
+  plotTrajectory(data, wallWavelength_t, wallAmplitude_t, averageRadius_t)
+  return data
+
+def visualize(dataFile, wavelength_v, aveRadius_v, amp_v, time_v, initialFlow_v, averageVelocityPlotBinNumber=20, numTimeIntervals=200):
+  plotInitialCoordinates(dataFile, wavelength_v, aveRadius_v, amp_v)
+  plotVelocityModuli(dataFile, averageVelocityPlotBinNumber)
+  averageVelocities(dataFile, numTimeIntervals, amp_v, aveRadius_v, time_v, initialFlow_v)
